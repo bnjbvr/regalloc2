@@ -49,3 +49,9 @@ name = "ion_checker"
 path = "fuzz_targets/ion_checker.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "set"
+path = "fuzz_targets/set.rs"
+test = false
+doc = false

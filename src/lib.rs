@@ -18,6 +18,7 @@ pub mod domtree;
 pub mod ion;
 pub mod moves;
 pub mod postorder;
+pub mod set;
 pub mod ssa;
 
 #[macro_use]

@@ -41,6 +41,7 @@ use crate::bitvec::BitVec;
 use crate::cfg::CFGInfo;
 use crate::index::ContainerComparator;
 use crate::moves::ParallelMoves;
+use crate::set::IntSet;
 use crate::{
     define_index, domtree, Allocation, AllocationKind, Block, Edit, Function, Inst, InstPosition,
     MachineEnv, Operand, OperandKind, OperandPolicy, OperandPos, Output, PReg, ProgPoint,
@@ -263,7 +264,7 @@ struct Env<'a, F: Function> {
     func: &'a F,
     env: &'a MachineEnv,
     cfginfo: CFGInfo,
-    liveins: Vec<BitVec>,
+    liveins: Vec<IntSet>,
     /// Blockparam outputs: from-vreg, (end of) from-block, (start of)
     /// to-block, to-vreg. The field order is significant: these are sorted so
     /// that a scan over vregs, then blocks in each range, can scan in
@@ -956,10 +957,8 @@ impl<'a, F: Function> Env<'a, F> {
     fn compute_liveness(&mut self) {
         // Create initial LiveIn bitsets.
         for _ in 0..self.func.blocks() {
-            self.liveins.push(BitVec::new());
+            self.liveins.push(IntSet::new());
         }
-
-        let num_vregs = self.func.num_vregs();
 
         let mut num_ranges = 0;
 
@@ -992,9 +991,9 @@ impl<'a, F: Function> Env<'a, F> {
 
             // Init live-set to union of liveins from successors
             // (excluding backedges; those are handled below).
-            let mut live = BitVec::with_capacity(num_vregs);
+            let mut live = IntSet::new();
             for &succ in self.func.block_succs(block) {
-                live.or(&self.liveins[succ.index()]);
+                live.merge(&mut self.liveins[succ.index()]);
             }
 
             // Initially, registers are assumed live for the whole block.
@@ -1124,8 +1123,7 @@ impl<'a, F: Function> Env<'a, F> {
                             }
                             self.insert_use_into_liverange_and_update_stats(lr, u);
                             // Remove from live-set.
-                            // TODO-cranelift: here is where we keep it live if it's a mod, not def.
-                            live.set(operand.vreg().vreg(), false);
+                            live.remove(operand.vreg().vreg());
                             vreg_ranges[operand.vreg().vreg()] = LiveRangeIndex::invalid();
                         }
                         OperandKind::Use => {
@@ -1177,7 +1175,7 @@ impl<'a, F: Function> Env<'a, F> {
                             self.insert_use_into_liverange_and_update_stats(lr, u);
 
                             // Add to live-set.
-                            live.set(operand.vreg().vreg(), true);
+                            live.add(operand.vreg().vreg());
                         }
                     }
                 }
@@ -1187,8 +1185,8 @@ impl<'a, F: Function> Env<'a, F> {
             // the block. Remove their live vregs from the live set
             // here.
             for vreg in self.func.block_params(block) {
-                if live.get(vreg.vreg()) {
-                    live.set(vreg.vreg(), false);
+                if live.contains(vreg.vreg()) {
+                    live.remove(vreg.vreg());
                 } else {
                     // Create trivial liverange if blockparam is dead.
                     let start = self.cfginfo.block_entry[block.index()];
@@ -1282,7 +1280,7 @@ impl<'a, F: Function> Env<'a, F> {
                 );
                 log::debug!(" -> loop range {:?}", loop_range);
                 for &loopblock in loop_blocks {
-                    self.liveins[loopblock.index()].or(&live);
+                    self.liveins[loopblock.index()].merge(&mut live);
                 }
                 for vreg in live.iter() {
                     log::debug!(
@@ -1460,6 +1458,11 @@ impl<'a, F: Function> Env<'a, F> {
 
                 iter = self.ranges[iter.index()].next_in_reg;
             }
+        }
+
+        // Sort all livein sets if in sparse mode to allow efficient queries later.
+        for livein_set in &mut self.liveins {
+            livein_set.sort();
         }
 
         self.clobbers.sort();
@@ -1918,6 +1921,7 @@ impl<'a, F: Function> Env<'a, F> {
                     if !conflicts.iter().any(|b| *b == conflict_bundle) {
                         conflicts.push(conflict_bundle);
                     }
+                    break;
                 } else {
                     log::debug!("   -> conflict with fixed reservation");
                     // range from a direct use of the PReg (due to clobber).
@@ -3153,7 +3157,7 @@ impl<'a, F: Function> Env<'a, F> {
                             continue;
                         }
                         log::debug!(" -> out of this range, requires half-move if live");
-                        if self.liveins[succ.index()].get(vreg.index()) {
+                        if self.liveins[succ.index()].contains(vreg.index()) {
                             log::debug!("  -> live at input to succ, adding halfmove");
                             half_moves.push(HalfMove {
                                 key: half_move_key(block, succ, vreg, HalfMoveKind::Source),
@@ -3273,7 +3277,7 @@ impl<'a, F: Function> Env<'a, F> {
                         blockparam_in_idx += 1;
                     }
 
-                    if !self.liveins[block.index()].get(vreg.index()) {
+                    if !self.liveins[block.index()].contains(vreg.index()) {
                         block = block.next();
                         continue;
                     }
