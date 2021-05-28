@@ -350,21 +350,6 @@ struct Env<'a, F: Function> {
     spillslots: Vec<SpillSlotData>,
     slots_by_size: Vec<SpillSlotList>,
 
-    // Program moves: these are moves in the provided program that we
-    // handle with our internal machinery, in order to avoid the
-    // overhead of ordinary operand processing. We expect the client
-    // to not generate any code for instructions that return
-    // `Some(..)` for `.is_move()`, and instead use the edits that we
-    // provide to implement those moves (or some simplified version of
-    // them) post-regalloc.
-    //
-    // (from-vreg, inst, from-alloc), sorted by (from-vreg, inst)
-    prog_move_srcs: Vec<((VRegIndex, Inst), Allocation)>,
-    // (to-vreg, inst, to-alloc), sorted by (to-vreg, inst)
-    prog_move_dsts: Vec<((VRegIndex, Inst), Allocation)>,
-    // (from-vreg, to-vreg) for bundle-merging.
-    prog_move_merges: Vec<(LiveRangeIndex, LiveRangeIndex)>,
-
     // When multiple fixed-register constraints are present on a
     // single VReg at a single program point (this can happen for,
     // e.g., call args that use the same value multiple times), we
@@ -590,18 +575,28 @@ impl Requirement {
     fn from_operand(op: Operand) -> Requirement {
         match op.policy() {
             OperandPolicy::FixedReg(preg) => Requirement::Fixed(preg),
-            OperandPolicy::Reg | OperandPolicy::Reuse(_) => Requirement::Register(op.class()),
+            OperandPolicy::Reg => Requirement::Register(op.class()),
+            OperandPolicy::Reuse(_) => Requirement::Any(op.class()),
             OperandPolicy::Stack => Requirement::Stack(op.class()),
             _ => Requirement::Any(op.class()),
         }
     }
 }
 
+/// The result of a `try_to_allocate_bundle_to_reg()` call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AllocRegResult {
+    /// Allocation successful.
     Allocated(Allocation),
+    /// Conflict with one or more bundles already allocated. The
+    /// conflicting bundles are given.
     Conflict(LiveBundleVec),
-    ConflictWithFixed,
+    /// Conflict with a fixed (unmovable) reservation. Max cost of
+    /// bundles encountered so far is given, as is the point of
+    /// conflict; these can be used for splitting.
+    ConflictWithFixed(u32, ProgPoint),
+    /// Conflict with a higher cost than the "max cost" parameter, if
+    /// given; this stops scanning early.
     ConflictHighCost,
 }
 
@@ -636,10 +631,6 @@ pub struct Stats {
     livein_iterations: usize,
     initial_liverange_count: usize,
     merged_bundle_count: usize,
-    prog_moves: usize,
-    prog_moves_dead_src: usize,
-    prog_move_merge_attempt: usize,
-    prog_move_merge_success: usize,
     process_bundle_count: usize,
     process_bundle_reg_probes_fixed: usize,
     process_bundle_reg_success_fixed: usize,
@@ -810,10 +801,6 @@ impl<'a, F: Function> Env<'a, F> {
             spilled_bundles: vec![],
             spillslots: vec![],
             slots_by_size: vec![],
-
-            prog_move_srcs: Vec::with_capacity(n / 2),
-            prog_move_dsts: Vec::with_capacity(n / 2),
-            prog_move_merges: Vec::with_capacity(n / 2),
 
             multi_fixed_reg_fixups: vec![],
             inserted_moves: vec![],
@@ -1194,7 +1181,8 @@ impl<'a, F: Function> Env<'a, F> {
                     }
                 }
 
-                // If this is a move, handle specially.
+                // If this is a move and at least one of the args is a
+                // RealReg, handle specially.
                 if let Some((src, dst)) = self.func.is_move(inst) {
                     // We can completely skip the move if it is
                     // trivial (vreg to same vreg).
@@ -1253,12 +1241,14 @@ impl<'a, F: Function> Env<'a, F> {
                                 Allocation::reg(dst_preg),
                                 Some(dst.vreg()),
                             );
+
+                            continue;
                         }
                         // If exactly one of source and dest (but not
                         // both) is a pinned-vreg, convert this into a
                         // ghost use on the other vreg with a FixedReg
                         // policy.
-                        else if self.vregs[src.vreg().vreg()].is_pinned
+                        if self.vregs[src.vreg().vreg()].is_pinned
                             || self.vregs[dst.vreg().vreg()].is_pinned
                         {
                             log::debug!(
@@ -1473,137 +1463,10 @@ impl<'a, F: Function> Env<'a, F> {
                                 // fixed-reg operand constraint, but
                                 // it's a dead move anyway).
                             }
-                        } else {
-                            // Redefine src and dst operands to have
-                            // positions of After and Before respectively
-                            // (see note below), and to have Any
-                            // constraints if they were originally Reg.
-                            let src_policy = match src.policy() {
-                                OperandPolicy::Reg => OperandPolicy::Any,
-                                x => x,
-                            };
-                            let dst_policy = match dst.policy() {
-                                OperandPolicy::Reg => OperandPolicy::Any,
-                                x => x,
-                            };
-                            let src = Operand::new(
-                                src.vreg(),
-                                src_policy,
-                                OperandKind::Use,
-                                OperandPos::After,
-                            );
-                            let dst = Operand::new(
-                                dst.vreg(),
-                                dst_policy,
-                                OperandKind::Def,
-                                OperandPos::Before,
-                            );
 
-                            if self.annotations_enabled && log::log_enabled!(log::Level::Debug) {
-                                self.annotate(
-                                    ProgPoint::after(inst),
-                                    format!(
-                                        " prog-move v{} ({:?}) -> v{} ({:?})",
-                                        src.vreg().vreg(),
-                                        src_policy,
-                                        dst.vreg().vreg(),
-                                        dst_policy,
-                                    ),
-                                );
-                            }
-
-                            // N.B.: in order to integrate with the move
-                            // resolution that joins LRs in general, we
-                            // conceptually treat the move as happening
-                            // between the move inst's After and the next
-                            // inst's Before. Thus the src LR goes up to
-                            // (exclusive) next-inst-pre, and the dst LR
-                            // starts at next-inst-pre. We have to take
-                            // care in our move insertion to handle this
-                            // like other inter-inst moves, i.e., at
-                            // `Regular` priority, so it properly happens
-                            // in parallel with other inter-LR moves.
-                            //
-                            // Why the progpoint between move and next
-                            // inst, and not the progpoint between prev
-                            // inst and move? Because a move can be the
-                            // first inst in a block, but cannot be the
-                            // last; so the following progpoint is always
-                            // within the same block, while the previous
-                            // one may be an inter-block point (and the
-                            // After of the prev inst in a different
-                            // block).
-
-                            // Handle the def w.r.t. liveranges: trim the
-                            // start of the range and mark it dead at this
-                            // point in our backward scan.
-                            let pos = ProgPoint::before(inst.next());
-                            let mut dst_lr = vreg_ranges[dst.vreg().vreg()];
-                            if !live.get(dst.vreg().vreg()) {
-                                let from = pos;
-                                let to = pos.next();
-                                dst_lr = self.add_liverange_to_vreg(
-                                    VRegIndex::new(dst.vreg().vreg()),
-                                    CodeRange { from, to },
-                                );
-                                log::debug!(" -> invalid LR for def; created {:?}", dst_lr);
-                            }
-                            log::debug!(" -> has existing LR {:?}", dst_lr);
-                            // Trim the LR to start here.
-                            if self.ranges[dst_lr.index()].range.from
-                                == self.cfginfo.block_entry[block.index()]
-                            {
-                                log::debug!(" -> started at block start; trimming to {:?}", pos);
-                                self.ranges[dst_lr.index()].range.from = pos;
-                            }
-                            self.ranges[dst_lr.index()].set_flag(LiveRangeFlag::StartsAtDef);
-                            live.set(dst.vreg().vreg(), false);
-                            vreg_ranges[dst.vreg().vreg()] = LiveRangeIndex::invalid();
-                            self.vreg_regs[dst.vreg().vreg()] = dst.vreg();
-
-                            // Handle the use w.r.t. liveranges: make it live
-                            // and create an initial LR back to the start of
-                            // the block.
-                            let pos = ProgPoint::after(inst);
-                            let src_lr = if !live.get(src.vreg().vreg()) {
-                                let range = CodeRange {
-                                    from: self.cfginfo.block_entry[block.index()],
-                                    to: pos.next(),
-                                };
-                                let src_lr = self.add_liverange_to_vreg(
-                                    VRegIndex::new(src.vreg().vreg()),
-                                    range,
-                                );
-                                vreg_ranges[src.vreg().vreg()] = src_lr;
-                                src_lr
-                            } else {
-                                vreg_ranges[src.vreg().vreg()]
-                            };
-
-                            log::debug!(" -> src LR {:?}", src_lr);
-
-                            // Add to live-set.
-                            let src_is_dead_after_move = !live.get(src.vreg().vreg());
-                            live.set(src.vreg().vreg(), true);
-
-                            // Add to program-moves lists.
-                            self.prog_move_srcs.push((
-                                (VRegIndex::new(src.vreg().vreg()), inst),
-                                Allocation::none(),
-                            ));
-                            self.prog_move_dsts.push((
-                                (VRegIndex::new(dst.vreg().vreg()), inst.next()),
-                                Allocation::none(),
-                            ));
-                            self.stats.prog_moves += 1;
-                            if src_is_dead_after_move {
-                                self.stats.prog_moves_dead_src += 1;
-                                self.prog_move_merges.push((src_lr, dst_lr));
-                            }
+                            continue;
                         }
                     }
-
-                    continue;
                 }
 
                 // Process defs and uses.
@@ -1954,11 +1817,6 @@ impl<'a, F: Function> Env<'a, F> {
         self.clobbers.sort_unstable();
         self.blockparam_ins.sort_unstable();
         self.blockparam_outs.sort_unstable();
-        self.prog_move_srcs.sort_unstable_by_key(|(pos, _)| *pos);
-        self.prog_move_dsts.sort_unstable_by_key(|(pos, _)| *pos);
-
-        log::debug!("prog_move_srcs = {:?}", self.prog_move_srcs);
-        log::debug!("prog_move_dsts = {:?}", self.prog_move_dsts);
 
         self.stats.initial_liverange_count = self.ranges.len();
         self.stats.blockparam_ins_count = self.blockparam_ins.len();
@@ -2301,48 +2159,6 @@ impl<'a, F: Function> Env<'a, F> {
             self.merge_bundles(from_bundle, to_bundle);
         }
 
-        // Attempt to merge move srcs/dsts.
-        for i in 0..self.prog_move_merges.len() {
-            let (src, dst) = self.prog_move_merges[i];
-            log::debug!("trying to merge move src LR {:?} to dst LR {:?}", src, dst);
-            let src = self.resolve_merged_lr(src);
-            let dst = self.resolve_merged_lr(dst);
-            log::debug!(
-                "resolved LR-construction merging chains: move-merge is now src LR {:?} to dst LR {:?}",
-                src,
-                dst
-            );
-
-            let dst_vreg = self.vreg_regs[self.ranges[dst.index()].vreg.index()];
-            let src_vreg = self.vreg_regs[self.ranges[src.index()].vreg.index()];
-            if self.vregs[src_vreg.vreg()].is_pinned && self.vregs[dst_vreg.vreg()].is_pinned {
-                continue;
-            }
-            if self.vregs[src_vreg.vreg()].is_pinned {
-                let dest_bundle = self.ranges[dst.index()].bundle;
-                let spillset = self.bundles[dest_bundle.index()].spillset;
-                self.spillsets[spillset.index()].reg_hint =
-                    self.func.is_pinned_vreg(src_vreg).unwrap();
-                continue;
-            }
-            if self.vregs[dst_vreg.vreg()].is_pinned {
-                let src_bundle = self.ranges[src.index()].bundle;
-                let spillset = self.bundles[src_bundle.index()].spillset;
-                self.spillsets[spillset.index()].reg_hint =
-                    self.func.is_pinned_vreg(dst_vreg).unwrap();
-                continue;
-            }
-
-            let src_bundle = self.ranges[src.index()].bundle;
-            assert!(src_bundle.is_valid());
-            let dest_bundle = self.ranges[dst.index()].bundle;
-            assert!(dest_bundle.is_valid());
-            self.stats.prog_move_merge_attempt += 1;
-            if self.merge_bundles(/* from */ dest_bundle, /* to */ src_bundle) {
-                self.stats.prog_move_merge_success += 1;
-            }
-        }
-
         log::debug!("done merging bundles");
     }
 
@@ -2518,7 +2334,8 @@ impl<'a, F: Function> Env<'a, F> {
             }
 
             // Otherwise, there is a conflict.
-            assert_eq!(*preg_range_iter.peek().unwrap().0, key);
+            let preg_key = *preg_range_iter.peek().unwrap().0;
+            assert_eq!(preg_key, key); // Must overlap.
             let preg_range = preg_range_iter.next().unwrap().1;
 
             log::debug!(" -> btree contains range {:?} that overlaps", preg_range);
@@ -2543,7 +2360,10 @@ impl<'a, F: Function> Env<'a, F> {
             } else {
                 log::debug!("   -> conflict with fixed reservation");
                 // range from a direct use of the PReg (due to clobber).
-                return AllocRegResult::ConflictWithFixed;
+                return AllocRegResult::ConflictWithFixed(
+                    max_conflict_weight,
+                    ProgPoint::from_index(preg_key.from),
+                );
             }
         }
 
@@ -2944,150 +2764,171 @@ impl<'a, F: Function> Env<'a, F> {
             log::debug!("attempt {}, req {:?}", attempts, req);
             debug_assert!(attempts < 100 * self.func.insts());
 
-            let (conflicting_bundles, first_conflict_point, first_conflict_reg) = match req {
-                Requirement::Fixed(preg) => {
-                    let preg_idx = PRegIndex::new(preg.index());
-                    self.stats.process_bundle_reg_probes_fixed += 1;
-                    log::debug!("trying fixed reg {:?}", preg_idx);
-                    match self.try_to_allocate_bundle_to_reg(bundle, preg_idx, None) {
-                        AllocRegResult::Allocated(alloc) => {
-                            self.stats.process_bundle_reg_success_fixed += 1;
-                            log::debug!(" -> allocated to fixed {:?}", preg_idx);
-                            self.spillsets[self.bundles[bundle.index()].spillset.index()]
-                                .reg_hint = alloc.as_reg().unwrap();
-                            return Ok(());
-                        }
-                        AllocRegResult::Conflict(bundles) => {
-                            log::debug!(" -> conflict with bundles {:?}", bundles);
-                            let first_bundle = bundles[0];
-                            (
-                                bundles,
-                                self.bundles[first_bundle.index()].ranges[0].range.from,
-                                preg,
-                            )
-                        }
-                        AllocRegResult::ConflictWithFixed => {
-                            log::debug!(" -> conflict with fixed alloc");
-                            // Empty conflicts set: there's nothing we can
-                            // evict, because fixed conflicts cannot be moved.
-                            (
-                                smallvec![],
-                                ProgPoint::before(Inst::new(0)),
-                                PReg::invalid(),
-                            )
-                        }
-                        AllocRegResult::ConflictHighCost => unreachable!(),
-                    }
-                }
-                Requirement::Register(class) => {
-                    // Scan all pregs and attempt to allocate.
-                    let mut lowest_cost_conflict_set: Option<LiveBundleVec> = None;
-                    let mut lowest_cost_conflict_cost: Option<u32> = None;
-                    let mut lowest_cost_conflict_point = ProgPoint::before(Inst::new(0));
-                    let mut lowest_cost_conflict_reg = PReg::invalid();
-
-                    // Heuristic: start the scan for an available
-                    // register at an offset influenced both by our
-                    // location in the code and by the bundle we're
-                    // considering. This has the effect of spreading
-                    // demand more evenly across registers.
-                    let scan_offset = self.ranges
-                        [self.bundles[bundle.index()].ranges[0].index.index()]
-                    .range
-                    .from
-                    .inst()
-                    .index()
-                        + bundle.index();
-
-                    self.stats.process_bundle_reg_probe_start_any += 1;
-                    for preg in RegTraversalIter::new(
-                        self.env,
-                        class,
-                        hint_reg,
-                        PReg::invalid(),
-                        scan_offset,
-                    ) {
-                        self.stats.process_bundle_reg_probes_any += 1;
+            let (conflicting_bundles, max_spill_weight, first_conflict_point, first_conflict_reg) =
+                match req {
+                    Requirement::Fixed(preg) => {
                         let preg_idx = PRegIndex::new(preg.index());
-                        log::debug!("trying preg {:?}", preg_idx);
-
-                        match self.try_to_allocate_bundle_to_reg(
-                            bundle,
-                            preg_idx,
-                            lowest_cost_conflict_cost,
-                        ) {
+                        self.stats.process_bundle_reg_probes_fixed += 1;
+                        log::debug!("trying fixed reg {:?}", preg_idx);
+                        match self.try_to_allocate_bundle_to_reg(bundle, preg_idx, None) {
                             AllocRegResult::Allocated(alloc) => {
-                                self.stats.process_bundle_reg_success_any += 1;
-                                log::debug!(" -> allocated to any {:?}", preg_idx);
+                                self.stats.process_bundle_reg_success_fixed += 1;
+                                log::debug!(" -> allocated to fixed {:?}", preg_idx);
                                 self.spillsets[self.bundles[bundle.index()].spillset.index()]
                                     .reg_hint = alloc.as_reg().unwrap();
                                 return Ok(());
                             }
                             AllocRegResult::Conflict(bundles) => {
                                 log::debug!(" -> conflict with bundles {:?}", bundles);
-
-                                let first_conflict_point =
-                                    self.bundles[bundles[0].index()].ranges[0].range.from;
-
-                                let cost = self.maximum_spill_weight_in_bundle_set(&bundles);
-
-                                if lowest_cost_conflict_cost.is_none() {
-                                    lowest_cost_conflict_cost = Some(cost);
-                                    lowest_cost_conflict_set = Some(bundles);
-                                    lowest_cost_conflict_point = first_conflict_point;
-                                    lowest_cost_conflict_reg = preg;
-                                } else if cost < lowest_cost_conflict_cost.unwrap() {
-                                    lowest_cost_conflict_cost = Some(cost);
-                                    lowest_cost_conflict_set = Some(bundles);
-                                    lowest_cost_conflict_point = first_conflict_point;
-                                    lowest_cost_conflict_reg = preg;
-                                }
+                                let max_spill_weight =
+                                    self.maximum_spill_weight_in_bundle_set(&bundles);
+                                let first_bundle = bundles[0];
+                                (
+                                    bundles,
+                                    max_spill_weight,
+                                    self.bundles[first_bundle.index()].ranges[0].range.from,
+                                    preg,
+                                )
                             }
-                            AllocRegResult::ConflictWithFixed => {
+                            AllocRegResult::ConflictWithFixed(max_cost, point) => {
                                 log::debug!(" -> conflict with fixed alloc");
-                                // Simply don't consider as an option.
+                                (smallvec![], max_cost, point, preg)
                             }
-                            AllocRegResult::ConflictHighCost => {
-                                // Simply don't consider -- we already have
-                                // a lower-cost conflict bundle option
-                                // to evict.
-                                continue;
-                            }
+                            AllocRegResult::ConflictHighCost => unreachable!(),
                         }
                     }
+                    Requirement::Register(class) | Requirement::Any(class) => {
+                        // Scan all pregs and attempt to allocate.
+                        let mut lowest_cost_conflict_set: Option<LiveBundleVec> = None;
+                        let mut lowest_cost_conflict_cost: Option<u32> = None;
+                        let mut lowest_cost_conflict_point = ProgPoint::before(Inst::new(0));
+                        let mut lowest_cost_conflict_reg = PReg::invalid();
 
-                    // Otherwise, we *require* a register, but didn't fit into
-                    // any with current bundle assignments. Hence, we will need
-                    // to either split or attempt to evict some bundles. Return
-                    // the conflicting bundles to evict and retry. Empty list
-                    // means nothing to try (due to fixed conflict) so we must
-                    // split instead.
-                    (
-                        lowest_cost_conflict_set.unwrap_or(smallvec![]),
-                        lowest_cost_conflict_point,
-                        lowest_cost_conflict_reg,
-                    )
-                }
+                        // Heuristic: start the scan for an available
+                        // register at an offset influenced both by our
+                        // location in the code and by the bundle we're
+                        // considering. This has the effect of spreading
+                        // demand more evenly across registers.
+                        let scan_offset = self.ranges
+                            [self.bundles[bundle.index()].ranges[0].index.index()]
+                        .range
+                        .from
+                        .inst()
+                        .index()
+                            + bundle.index();
 
-                Requirement::Stack(_) => {
-                    // If we must be on the stack, mark our spillset
-                    // as required immediately.
-                    self.spillsets[self.bundles[bundle.index()].spillset.index()].required = true;
-                    return Ok(());
-                }
+                        self.stats.process_bundle_reg_probe_start_any += 1;
+                        for preg in RegTraversalIter::new(
+                            self.env,
+                            class,
+                            hint_reg,
+                            PReg::invalid(),
+                            scan_offset,
+                        ) {
+                            self.stats.process_bundle_reg_probes_any += 1;
+                            let preg_idx = PRegIndex::new(preg.index());
+                            log::debug!("trying preg {:?}", preg_idx);
 
-                Requirement::Any(_) | Requirement::Unknown => {
-                    // If a register is not *required*, spill now (we'll retry
-                    // allocation on spilled bundles later).
-                    log::debug!("spilling bundle {:?} to spilled_bundles list", bundle);
-                    self.spilled_bundles.push(bundle);
-                    return Ok(());
-                }
+                            match self.try_to_allocate_bundle_to_reg(
+                                bundle,
+                                preg_idx,
+                                lowest_cost_conflict_cost,
+                            ) {
+                                AllocRegResult::Allocated(alloc) => {
+                                    self.stats.process_bundle_reg_success_any += 1;
+                                    log::debug!(" -> allocated to any {:?}", preg_idx);
+                                    self.spillsets[self.bundles[bundle.index()].spillset.index()]
+                                        .reg_hint = alloc.as_reg().unwrap();
+                                    return Ok(());
+                                }
+                                AllocRegResult::Conflict(bundles) => {
+                                    log::debug!(" -> conflict with bundles {:?}", bundles);
 
-                Requirement::Conflict => {
-                    break;
-                }
-            };
+                                    let first_conflict_point =
+                                        self.bundles[bundles[0].index()].ranges[0].range.from;
+
+                                    let cost = self.maximum_spill_weight_in_bundle_set(&bundles);
+
+                                    if lowest_cost_conflict_cost.is_none()
+                                        || cost < lowest_cost_conflict_cost.unwrap()
+                                    {
+                                        lowest_cost_conflict_cost = Some(cost);
+                                        lowest_cost_conflict_set = Some(bundles);
+                                        lowest_cost_conflict_point = first_conflict_point;
+                                        lowest_cost_conflict_reg = preg;
+                                    }
+                                }
+                                AllocRegResult::ConflictWithFixed(max_cost, point) => {
+                                    log::debug!(" -> conflict with fixed alloc at {:?}", point);
+
+                                    if point > self.bundles[bundle.index()].ranges[0].range.from
+                                        && (lowest_cost_conflict_cost.is_none()
+                                            || max_cost < lowest_cost_conflict_cost.unwrap())
+                                    {
+                                        lowest_cost_conflict_cost = Some(max_cost);
+                                        lowest_cost_conflict_set = Some(smallvec![]); // empty --> fixed conflict.
+                                        lowest_cost_conflict_point = point;
+                                        lowest_cost_conflict_reg = preg;
+                                    }
+                                }
+                                AllocRegResult::ConflictHighCost => {
+                                    // Simply don't consider -- we already have
+                                    // a lower-cost conflict bundle option
+                                    // to evict.
+                                }
+                            }
+                        }
+
+                        // No allocation: if `Any` rather than `Reg`, just spill.
+                        if let Requirement::Any(_) = req {
+                            self.spilled_bundles.push(bundle);
+                            return Ok(());
+                        }
+
+                        let max_spill_weight = if let &Some(ref s) = &lowest_cost_conflict_set {
+                            if s.len() > 0 {
+                                self.maximum_spill_weight_in_bundle_set(s)
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+
+                        // Otherwise, we *require* a register, but didn't fit into
+                        // any with current bundle assignments. Hence, we will need
+                        // to either split or attempt to evict some bundles. Return
+                        // the conflicting bundles to evict and retry. Empty list
+                        // means nothing to try (due to fixed conflict) so we must
+                        // split instead.
+                        (
+                            lowest_cost_conflict_set.unwrap_or(smallvec![]),
+                            max_spill_weight,
+                            lowest_cost_conflict_point,
+                            lowest_cost_conflict_reg,
+                        )
+                    }
+
+                    Requirement::Stack(_) => {
+                        // If we must be on the stack, mark our spillset
+                        // as required immediately.
+                        self.spillsets[self.bundles[bundle.index()].spillset.index()].required =
+                            true;
+                        return Ok(());
+                    }
+
+                    Requirement::Unknown => {
+                        // Empty range: spill now (we'll retry
+                        // allocation on spilled bundles later).
+                        log::debug!("spilling bundle {:?} to spilled_bundles list", bundle);
+                        self.spilled_bundles.push(bundle);
+                        return Ok(());
+                    }
+
+                    Requirement::Conflict => {
+                        break;
+                    }
+                };
 
             log::debug!(" -> conflict set {:?}", conflicting_bundles);
             log::debug!(
@@ -3095,6 +2936,10 @@ impl<'a, F: Function> Env<'a, F> {
                 first_conflict_point,
                 first_conflict_reg
             );
+
+            let bundle_start = self.bundles[bundle.index()].ranges[0].range.from;
+            split_at_point = std::cmp::max(first_conflict_point, bundle_start);
+            requeue_with_reg = first_conflict_reg;
 
             // If we have already tried evictions once before and are
             // still unsuccessful, give up and move on to splitting as
@@ -3107,10 +2952,6 @@ impl<'a, F: Function> Env<'a, F> {
             if conflicting_bundles.is_empty() {
                 break;
             }
-
-            let bundle_start = self.bundles[bundle.index()].ranges[0].range.from;
-            split_at_point = std::cmp::max(first_conflict_point, bundle_start);
-            requeue_with_reg = first_conflict_reg;
 
             // Adjust `split_at_point` if it is within a deeper loop
             // than the bundle start -- hoist it to just before the
@@ -3132,7 +2973,6 @@ impl<'a, F: Function> Env<'a, F> {
 
             // If the maximum spill weight in the conflicting-bundles set is >= this bundle's spill
             // weight, then don't evict.
-            let max_spill_weight = self.maximum_spill_weight_in_bundle_set(&conflicting_bundles);
             log::debug!(
                 " -> max_spill_weight = {}; our spill weight {}",
                 max_spill_weight,
@@ -3530,8 +3370,6 @@ impl<'a, F: Function> Env<'a, F> {
 
         let mut blockparam_in_idx = 0;
         let mut blockparam_out_idx = 0;
-        let mut prog_move_src_idx = 0;
-        let mut prog_move_dst_idx = 0;
         for vreg in 0..self.vregs.len() {
             let vreg = VRegIndex::new(vreg);
 
@@ -3916,67 +3754,6 @@ impl<'a, F: Function> Env<'a, F> {
                     move_src_start,
                     move_src_end
                 );
-                while prog_move_src_idx < self.prog_move_srcs.len()
-                    && self.prog_move_srcs[prog_move_src_idx].0 < move_src_start
-                {
-                    log::debug!(" -> skipping idx {}", prog_move_src_idx);
-                    prog_move_src_idx += 1;
-                }
-                while prog_move_src_idx < self.prog_move_srcs.len()
-                    && self.prog_move_srcs[prog_move_src_idx].0 < move_src_end
-                {
-                    log::debug!(
-                        " -> setting idx {} ({:?}) to alloc {:?}",
-                        prog_move_src_idx,
-                        self.prog_move_srcs[prog_move_src_idx].0,
-                        alloc
-                    );
-                    self.prog_move_srcs[prog_move_src_idx].1 = alloc;
-                    prog_move_src_idx += 1;
-                }
-
-                // move dsts happen at Before point.
-                //
-                // Range from inst-Before includes cur inst, while inst-After includes only next inst.
-                let move_dst_start = if range.from.pos() == InstPosition::Before {
-                    (vreg, range.from.inst())
-                } else {
-                    (vreg, range.from.inst().next())
-                };
-                // Range to (exclusive) inst-Before includes prev
-                // inst, so to (exclusive) cur inst; range to
-                // (exclusive) inst-After includes cur inst, so to
-                // (exclusive) next inst.
-                let move_dst_end = if range.to.pos() == InstPosition::Before {
-                    (vreg, range.to.inst())
-                } else {
-                    (vreg, range.to.inst().next())
-                };
-                log::debug!(
-                    "vreg {:?} range {:?}: looking for program-move dests from {:?} to {:?}",
-                    vreg,
-                    range,
-                    move_dst_start,
-                    move_dst_end
-                );
-                while prog_move_dst_idx < self.prog_move_dsts.len()
-                    && self.prog_move_dsts[prog_move_dst_idx].0 < move_dst_start
-                {
-                    log::debug!(" -> skipping idx {}", prog_move_dst_idx);
-                    prog_move_dst_idx += 1;
-                }
-                while prog_move_dst_idx < self.prog_move_dsts.len()
-                    && self.prog_move_dsts[prog_move_dst_idx].0 < move_dst_end
-                {
-                    log::debug!(
-                        " -> setting idx {} ({:?}) to alloc {:?}",
-                        prog_move_dst_idx,
-                        self.prog_move_dsts[prog_move_dst_idx].0,
-                        alloc
-                    );
-                    self.prog_move_dsts[prog_move_dst_idx].1 = alloc;
-                    prog_move_dst_idx += 1;
-                }
 
                 prev = entry.index;
             }
@@ -4188,42 +3965,6 @@ impl<'a, F: Function> Env<'a, F> {
                     }
                 }
             }
-        }
-
-        // Sort the prog-moves lists and insert moves to reify the
-        // input program's move operations.
-        self.prog_move_srcs
-            .sort_unstable_by_key(|((_, inst), _)| *inst);
-        self.prog_move_dsts
-            .sort_unstable_by_key(|((_, inst), _)| inst.prev());
-        let prog_move_srcs = std::mem::replace(&mut self.prog_move_srcs, vec![]);
-        let prog_move_dsts = std::mem::replace(&mut self.prog_move_dsts, vec![]);
-        assert_eq!(prog_move_srcs.len(), prog_move_dsts.len());
-        for (&((_, from_inst), from_alloc), &((to_vreg, to_inst), to_alloc)) in
-            prog_move_srcs.iter().zip(prog_move_dsts.iter())
-        {
-            log::debug!(
-                "program move at inst {:?}: alloc {:?} -> {:?} (v{})",
-                from_inst,
-                from_alloc,
-                to_alloc,
-                to_vreg.index(),
-            );
-            assert!(!from_alloc.is_none());
-            assert!(!to_alloc.is_none());
-            assert_eq!(from_inst, to_inst.prev());
-            // N.B.: these moves happen with the *same* priority as
-            // LR-to-LR moves, because they work just like them: they
-            // connect a use at one progpoint (move-After) with a def
-            // at an adjacent progpoint (move+1-Before), so they must
-            // happen in parallel with all other LR-to-LR moves.
-            self.insert_move(
-                ProgPoint::before(to_inst),
-                InsertMovePrio::Regular,
-                from_alloc,
-                to_alloc,
-                Some(self.vreg_regs[to_vreg.index()]),
-            );
         }
     }
 
