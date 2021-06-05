@@ -3687,6 +3687,188 @@ impl<'a, F: Function> Env<'a, F> {
         log::debug!("spillslot allocator done");
     }
 
+    fn remove_redundant_spills(&mut self) {
+        // Early out: if no spillslots, then no need to look for
+        // redundant spills.
+        if self.num_spillslots == 0 {
+            return;
+        }
+
+        // At each basic block in the almost-final code (including
+        // edits), track whether a given register is a copy of a
+        // particular stack slot (or in other words, whether a stack
+        // slot contains the up-to-date value of the register). If it
+        // is, and we then see a move from the register to the slot (a
+        // spill), we can elide that move.
+        //
+        // This comes up frequently in practice because the initial
+        // live-range stitching will generate moves between spillslots
+        // and registers whenever a value moves into and then out of a
+        // register, without regard for whether the value is "dirty"
+        // (more updated than the designated spill-slot for its
+        // bundle) or not. This simplifies the rest of the allocator
+        // -- we can just think of a vreg or bundle as always existing
+        // in exactly one place, and moving values when that place
+        // changes -- but we want to avoid spills when we can. When a
+        // value is reloaded into a register just to use it, but not
+        // to modify it, then there is no need to re-spill it when its
+        // current live-range ends.
+        //
+        // We perform this analysis with a standard iterative dataflow
+        // approach. At the start of each basic block, we record a
+        // sparse preg-to-stack mapping. The meet function is
+        // intersection; conflicting mappings are dropped.
+        //
+        // The transfer rules are:
+        // - When we see a move from stackN to pregM, set pregM's
+        //   abstract value to AbstractStack(N).
+        // - When we see a move from pregN to pregM, transfer the
+        //   abstract value from pregN to pregM.
+        // - When we see a def or mod on pregN, set its abstract
+        //   value to None.
+        // - When we see a move from anywhere to stackN, if the
+        //   stored value is not AbstractStack(N), remove all
+        //   other mappings from pregX to stackN.
+
+        #[derive(Clone, Debug)]
+        struct Mappings {
+            /// Initialized? If true, a missing reg in the map below
+            /// indicates BOT (the value is not a stack value); if
+            /// false, all values are TOP (not yet analyzed).
+            initialized: bool,
+            /// Which stack slot, if any, a given preg contains.  We
+            /// only track 16-bit slot numbers; any spills to slots >
+            /// 2^16 are out of luck.
+            preg_to_stack: FxHashMap<u8, u16>,
+        }
+        const TOP: u16 = u16::MAX;
+        const BOT: u16 = u16::MAX - 1;
+
+        impl std::default::Default for Mappings {
+            fn default() -> Self {
+                Mappings {
+                    initialized: false,
+                    preg_to_stack: FxHashMap::default(),
+                }
+            }
+        }
+
+        impl Mappings {
+            fn empty() -> Self {
+                Mappings {
+                    initialized: true,
+                    preg_to_stack: FxHashMap::default(),
+                }
+            }
+
+            fn meet_from(&mut self, other: &Mappings) -> bool {
+                if !other.initialized {
+                    return false;
+                }
+                if !self.initialized {
+                    *self = other.clone();
+                    return true;
+                }
+                let mut changed = false;
+                for (preg, this) in &mut self.preg_to_stack {
+                    let other = other.preg_to_stack.get(preg).map(|p| *p).unwrap_or(BOT);
+                    if *this == other {
+                        continue;
+                    }
+                    if other == TOP {
+                        continue;
+                    }
+                    if *this == BOT {
+                        continue;
+                    }
+
+                    if *this == TOP || other == BOT {
+                        *this = other;
+                    } else {
+                        *this = BOT;
+                    }
+                    changed = true;
+                }
+
+                changed
+            }
+
+            fn load_stack_to_reg(&mut self, stack: u16, preg: u8) {
+                assert!(self.initialized);
+                assert!(stack < BOT);
+                self.preg_to_stack.insert(preg, stack);
+            }
+
+            fn store_reg_to_stack(&mut self, preg: u8, stack: u16) {
+                assert!(self.initialized);
+                assert!(stack < BOT);
+                for val in self.preg_to_stack.values_mut() {
+                    if *val == stack {
+                        *val = BOT;
+                    }
+                }
+                self.preg_to_stack.insert(preg, stack);
+            }
+
+            fn clobber_reg(&mut self, preg: u8) {
+                assert!(preg < 64);
+                self.preg_to_stack.remove(&preg);
+            }
+
+            fn reg_has_stack(&self, preg: u8, stack: u16) -> bool {
+                assert!(stack < BOT);
+                self.preg_to_stack.get(&preg) == Some(stack)
+            }
+        }
+
+        let mut mappings: Vec<Mappings> = vec![Mappings::default(); self.func.blocks()];
+        let mut workqueue = VecDeque::new();
+        let mut workqueue_set = FxHashSet::default();
+        let mut edit_idx_for_block = vec![];
+
+        let mut edit_idx = 0;
+        for block in 0..self.func.blocks() {
+            let block_insns = self.func.block_insns(Block::new(block));
+            let block_start = block_insns.first();
+            while edit_idx < self.edits.len() && ProgPoint::from_index(self.edits[edit_idx].0).inst() < block_start {
+                edit_idx += 1;
+            }
+            edit_idx_for_block.push(edit_idx);
+        }
+
+        let entry = self.func.entry_block();
+        workqueue.push_back(entry);
+        workqueue_set.insert(entry);
+        mappings[entry] = Mappings::empty();
+        while let Some(block) = workqueue.pop_front() {
+            workqueue_set.remove(&block);
+
+            let mut map = mappings[block.index()].clone();
+            let mut edit_idx = edit_idx_for_block[block.index()];
+            for inst in self.func.block_insns(block).iter() {
+                // Process pre-edits.
+                while edit_idx < self.edits.len() && ProgPoint::from_idx(self.edits[edit_idx].0) < ProgPoint::before(inst) {
+                    edit_idx += 1;
+                }
+                while edit_idx < self.edits.len() && ProgPoint::from_idx(self.edits[edit_idx].0) == ProgPoint::before(inst) {
+                    match &self.edits[edit_idx].2 {
+                        Edit::Move { from, to, .. } => {
+                            if from.is_stack() && to.is_reg() && from.as_stack().unwrap().index() < (BOT as usize) {
+                                map.load_stack_to_reg(from.as_stack().unwrap().index() as u16, to.as_reg().unwrap().index() as u8);
+                            }
+                        }
+                        _ => {}
+                    }
+                    edit_idx += 1;
+                }
+
+                // Process mods and defs.
+
+                // Process post-edits.
+            }
+        }
+    }
+
     fn is_start_of_block(&self, pos: ProgPoint) -> bool {
         let block = self.cfginfo.insn_block[pos.inst().index()];
         pos == self.cfginfo.block_entry[block.index()]
