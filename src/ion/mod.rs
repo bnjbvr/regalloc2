@@ -636,7 +636,8 @@ struct InsertedMove {
     prio: InsertMovePrio,
     from_alloc: Allocation,
     to_alloc: Allocation,
-    to_vreg: Option<VReg>,
+    /// (from, to) vreg ownership change of value.
+    vreg_move: Option<(VReg, VReg)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3848,7 +3849,7 @@ impl<'a, F: Function> Env<'a, F> {
         prio: InsertMovePrio,
         from_alloc: Allocation,
         to_alloc: Allocation,
-        to_vreg: Option<VReg>,
+        vreg_move: Option<(VReg, VReg)>,
     ) {
         debug!(
             "insert_move: pos {:?} prio {:?} from_alloc {:?} to_alloc {:?}",
@@ -3865,7 +3866,7 @@ impl<'a, F: Function> Env<'a, F> {
             prio,
             from_alloc,
             to_alloc,
-            to_vreg,
+            vreg_move,
         });
     }
 
@@ -4863,8 +4864,12 @@ impl<'a, F: Function> Env<'a, F> {
                         let s = format!("blockparams vregs:{:?} allocs:{:?}", vregs, allocs);
                         self.annotate(ProgPoint::from_index(pos), s);
                     }
-                    &Edit::DefAlloc { alloc, vreg } => {
+                    &Edit::DefAllocVReg { alloc, vreg } => {
                         let s = format!("defalloc {:?} := {:?}", alloc, vreg);
+                        self.annotate(ProgPoint::from_index(pos), s);
+                    }
+                    &Edit::AssertAllocVReg { alloc, vreg } => {
+                        let s = format!("assertalloc {:?} == {:?}", alloc, vreg);
                         self.annotate(ProgPoint::from_index(pos), s);
                     }
                 }
