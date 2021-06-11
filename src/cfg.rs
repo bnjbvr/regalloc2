@@ -43,6 +43,8 @@ pub struct CFGInfo {
     /// indices. Otherwise, it will be approximate, but should still
     /// be usable for heuristic purposes.
     pub approx_loop_depth: Vec<u32>,
+    /// What are the loop-depth transition points?
+    pub loop_transition_points: Vec<ProgPoint>,
 }
 
 impl CFGInfo {
@@ -145,6 +147,15 @@ impl CFGInfo {
             }
         }
 
+        let mut loop_transition_points = vec![];
+        let mut last_depth = approx_loop_depth[0];
+        for (block, &depth) in approx_loop_depth.iter().enumerate() {
+            if depth > last_depth {
+                loop_transition_points.push(block_entry[block]);
+            }
+            last_depth = depth;
+        }
+
         Ok(CFGInfo {
             postorder,
             domtree,
@@ -155,6 +166,7 @@ impl CFGInfo {
             block_exit,
             pred_pos,
             approx_loop_depth,
+            loop_transition_points,
         })
     }
 

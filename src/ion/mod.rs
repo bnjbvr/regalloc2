@@ -43,10 +43,10 @@ use crate::{
 use fxhash::{FxHashMap, FxHashSet};
 use log::debug;
 use smallvec::{smallvec, SmallVec};
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fmt::Debug;
+use std::{cmp::Ordering, u8};
 
 /// A range from `from` (inclusive) to `to` (exclusive).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,28 +171,35 @@ impl LiveRange {
     pub fn set_uses_spill_weight(&mut self, weight: u32) {
         assert!(weight < (1 << 29));
         self.uses_spill_weight_and_flags =
-            (self.uses_spill_weight_and_flags & 0xe000_0000) | weight;
+            (self.uses_spill_weight_and_flags & 0xe000_0000) | (weight as u32);
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Use {
     operand: Operand,
-    pos: ProgPoint,
-    slot: u8,
-    weight: u16,
+    pos_and_slot: u32,
+    weight: u32,
 }
 
 impl Use {
     #[inline(always)]
     fn new(operand: Operand, pos: ProgPoint, slot: u8) -> Self {
+        assert!(pos.to_index() < (1 << 24));
         Self {
             operand,
-            pos,
-            slot,
+            pos_and_slot: ((slot as u32) << 24) | pos.to_index(),
             // Weight is updated on insertion into LR.
-            weight: 0,
+            weight: zero_spill_weight(),
         }
+    }
+
+    fn pos(self) -> ProgPoint {
+        ProgPoint::from_index(self.pos_and_slot & 0x00ffffff)
+    }
+
+    fn slot(self) -> u8 {
+        (self.pos_and_slot >> 24) as u8
     }
 }
 
@@ -515,16 +522,39 @@ impl LiveRangeSet {
 
 #[inline(always)]
 fn spill_weight_from_policy(policy: OperandPolicy, loop_depth: usize, is_def: bool) -> u32 {
-    // A bonus of 1000 for one loop level, 4000 for two loop levels,
-    // 16000 for three loop levels, etc. Avoids exponentiation.
-    let hot_bonus = std::cmp::min(16000, 1000 * (1 << (2 * loop_depth)));
     let def_bonus = if is_def { 2000 } else { 0 };
     let policy_bonus = match policy {
         OperandPolicy::Any => 1000,
         OperandPolicy::Reg | OperandPolicy::FixedReg(_) => 2000,
         _ => 0,
     };
-    hot_bonus + def_bonus + policy_bonus
+    loop_adjusted_spill_weight(def_bonus + policy_bonus, loop_depth)
+}
+
+#[inline(always)]
+fn loop_adjusted_spill_weight(weight: u32, loop_depth: usize) -> u32 {
+    let loop_depth = std::cmp::min(0x1f, loop_depth) as u32;
+    let level = loop_depth << 24;
+    let weight = std::cmp::min((1 << 24) - 1, weight);
+    weight | level
+}
+
+#[inline(always)]
+fn zero_spill_weight() -> u32 {
+    // Because we take the *min* loop depth in the bundle, we start
+    // with the max here.
+    0x1f000000
+}
+
+#[inline(always)]
+fn add_spill_weight(a: u32, b: u32) -> u32 {
+    let total_weight = (a & ((1 << 24) - 1)) + (b & ((1 << 24) - 1));
+    let a_depth = a & 0xff000000;
+    let b_depth = b & 0xff000000;
+    // Take the *minimum* loop depth. We want ranges that span out of
+    // an inner loop to be easy to spill, but then when they split,
+    // the piece that is inside the loop is much harder to spill.
+    std::cmp::min(a_depth, b_depth) + std::cmp::min(total_weight, (1 << 24) - 1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1109,11 +1139,11 @@ impl<'a, F: Function> Env<'a, F> {
     fn insert_use_into_liverange(&mut self, into: LiveRangeIndex, mut u: Use) {
         let operand = u.operand;
         let policy = operand.policy();
-        let block = self.cfginfo.insn_block[u.pos.inst().index()];
+        let block = self.cfginfo.insn_block[u.pos().inst().index()];
         let loop_depth = self.cfginfo.approx_loop_depth[block.index()] as usize;
         let weight =
             spill_weight_from_policy(policy, loop_depth, operand.kind() != OperandKind::Use);
-        u.weight = u16::try_from(weight).expect("weight too large for u16 field");
+        u.weight = weight;
 
         log::debug!(
             "insert use {:?} into lr {:?} with weight {}",
@@ -1129,7 +1159,8 @@ impl<'a, F: Function> Env<'a, F> {
         self.ranges[into.index()].uses.push(u);
 
         // Update stats.
-        self.ranges[into.index()].uses_spill_weight_and_flags += weight;
+        let w = add_spill_weight(self.ranges[into.index()].uses_spill_weight(), weight);
+        self.ranges[into.index()].set_uses_spill_weight(w);
         log::debug!(
             "  -> now range has weight {}",
             self.ranges[into.index()].uses_spill_weight(),
@@ -1623,25 +1654,16 @@ impl<'a, F: Function> Env<'a, F> {
                         } else {
                             // Redefine src and dst operands to have
                             // positions of After and Before respectively
-                            // (see note below), and to have Any
-                            // constraints if they were originally Reg.
-                            let src_policy = match src.policy() {
-                                OperandPolicy::Reg => OperandPolicy::Any,
-                                x => x,
-                            };
-                            let dst_policy = match dst.policy() {
-                                OperandPolicy::Reg => OperandPolicy::Any,
-                                x => x,
-                            };
+                            // (see note below).
                             let src = Operand::new(
                                 src.vreg(),
-                                src_policy,
+                                src.policy(),
                                 OperandKind::Use,
                                 OperandPos::After,
                             );
                             let dst = Operand::new(
                                 dst.vreg(),
-                                dst_policy,
+                                dst.policy(),
                                 OperandKind::Def,
                                 OperandPos::Before,
                             );
@@ -1652,9 +1674,9 @@ impl<'a, F: Function> Env<'a, F> {
                                     format!(
                                         " prog-move v{} ({:?}) -> v{} ({:?})",
                                         src.vreg().vreg(),
-                                        src_policy,
+                                        src.policy(),
                                         dst.vreg().vreg(),
-                                        dst_policy,
+                                        dst.policy(),
                                     ),
                                 );
                             }
@@ -1732,6 +1754,13 @@ impl<'a, F: Function> Env<'a, F> {
                             // Add to live-set.
                             let src_is_dead_after_move = !live.get(src.vreg().vreg());
                             live.set(src.vreg().vreg(), true);
+
+                            // Add a use to the src_lr so that we
+                            // account for the weights properly.
+                            self.insert_use_into_liverange(
+                                src_lr,
+                                Use::new(src, ProgPoint::after(inst), SLOT_NONE),
+                            );
 
                             // Add to program-moves lists.
                             self.prog_move_srcs.push((
@@ -1945,7 +1974,7 @@ impl<'a, F: Function> Env<'a, F> {
             debug_assert!(self.ranges[range]
                 .uses
                 .windows(2)
-                .all(|win| win[0].pos <= win[1].pos));
+                .all(|win| win[0].pos() <= win[1].pos()));
         }
 
         // Insert safepoint virtual stack uses, if needed.
@@ -1992,7 +2021,7 @@ impl<'a, F: Function> Env<'a, F> {
                 if inserted {
                     self.ranges[index.index()]
                         .uses
-                        .sort_unstable_by_key(|u| u.pos);
+                        .sort_unstable_by_key(|u| u.pos());
                 }
 
                 if safepoint_idx >= self.safepoints.len() {
@@ -2074,8 +2103,8 @@ impl<'a, F: Function> Env<'a, F> {
                 };
 
                 for u in &mut self.ranges[range.index()].uses {
-                    let pos = u.pos;
-                    let slot = u.slot as usize;
+                    let pos = u.pos();
+                    let slot = u.slot() as usize;
                     fixup_multi_fixed_vregs(
                         pos,
                         slot,
@@ -2601,7 +2630,12 @@ impl<'a, F: Function> Env<'a, F> {
                 r.uses_spill_weight(),
             );
             for u in &r.uses {
-                log::debug!(" * use at {:?} (slot {}): {:?}", u.pos, u.slot, u.operand);
+                log::debug!(
+                    " * use at {:?} (slot {}): {:?}",
+                    u.pos(),
+                    u.slot(),
+                    u.operand
+                );
             }
         }
     }
@@ -2816,6 +2850,12 @@ impl<'a, F: Function> Env<'a, F> {
     fn recompute_bundle_properties(&mut self, bundle: LiveBundleIndex) {
         log::debug!("recompute bundle properties: bundle {:?}", bundle);
 
+        for i in 0..self.bundles[bundle.index()].ranges.len() {
+            let range = self.bundles[bundle.index()].ranges[i].index;
+            self.recompute_range_properties(range);
+        }
+        self.bundles[bundle.index()].prio = self.compute_bundle_prio(bundle);
+
         let minimal;
         let mut fixed = false;
         let mut stack = false;
@@ -2831,11 +2871,11 @@ impl<'a, F: Function> Env<'a, F> {
             for u in &first_range_data.uses {
                 log::debug!("  -> use: {:?}", u);
                 if let OperandPolicy::FixedReg(_) = u.operand.policy() {
-                    log::debug!("  -> fixed use at {:?}: {:?}", u.pos, u.operand);
+                    log::debug!("  -> fixed use at {:?}: {:?}", u.pos(), u.operand);
                     fixed = true;
                 }
                 if let OperandPolicy::Stack = u.operand.policy() {
-                    log::debug!("  -> stack use at {:?}: {:?}", u.pos, u.operand);
+                    log::debug!("  -> stack use at {:?}: {:?}", u.pos(), u.operand);
                     stack = true;
                 }
                 if stack && fixed {
@@ -2867,15 +2907,20 @@ impl<'a, F: Function> Env<'a, F> {
                 1_000_000
             }
         } else {
-            let mut total = 0;
+            let mut total = zero_spill_weight();
             for entry in &self.bundles[bundle.index()].ranges {
                 let range_data = &self.ranges[entry.index.index()];
                 log::debug!(
                     "  -> uses spill weight: +{}",
                     range_data.uses_spill_weight()
                 );
-                total += range_data.uses_spill_weight();
+                total = add_spill_weight(total, range_data.uses_spill_weight());
             }
+            let total = if total == zero_spill_weight() {
+                0
+            } else {
+                total
+            };
 
             if self.bundles[bundle.index()].prio > 0 {
                 log::debug!(
@@ -2903,11 +2948,12 @@ impl<'a, F: Function> Env<'a, F> {
 
     fn recompute_range_properties(&mut self, range: LiveRangeIndex) {
         let rangedata = &mut self.ranges[range.index()];
-        let mut w = 0;
+        let mut w = zero_spill_weight();
         for u in &rangedata.uses {
-            w += u.weight as u32;
+            w = add_spill_weight(w, u.weight);
             log::debug!("range{}: use {:?}", range.index(), u);
         }
+        log::debug!("range{}: total spill weight {}", range.index(), w);
         rangedata.set_uses_spill_weight(w);
         if rangedata.uses.len() > 0 && rangedata.uses[0].operand.kind() == OperandKind::Def {
             // Note that we *set* the flag here, but we never *clear*
@@ -2945,6 +2991,7 @@ impl<'a, F: Function> Env<'a, F> {
         bundle: LiveBundleIndex,
         mut split_at: ProgPoint,
         reg_hint: PReg,
+        starts_at_loop_header: bool,
     ) {
         self.stats.splits += 1;
         log::debug!(
@@ -2981,7 +3028,7 @@ impl<'a, F: Function> Env<'a, F> {
             let mut first_use = None;
             'outer: for entry in &self.bundles[bundle.index()].ranges {
                 for u in &self.ranges[entry.index.index()].uses {
-                    first_use = Some(u.pos);
+                    first_use = Some(u.pos());
                     break 'outer;
                 }
             }
@@ -3077,7 +3124,7 @@ impl<'a, F: Function> Env<'a, F> {
             let first_use = self.ranges[orig_lr.index()]
                 .uses
                 .iter()
-                .position(|u| u.pos >= split_at)
+                .position(|u| u.pos() >= split_at)
                 .unwrap_or(self.ranges[orig_lr.index()].uses.len());
             let rest_uses: UseList = self.ranges[orig_lr.index()]
                 .uses
@@ -3087,8 +3134,6 @@ impl<'a, F: Function> Env<'a, F> {
                 .collect();
             self.ranges[new_lr.index()].uses = rest_uses;
             self.ranges[orig_lr.index()].uses.truncate(first_use);
-            self.recompute_range_properties(orig_lr);
-            self.recompute_range_properties(new_lr);
             new_lr_list[0].index = new_lr;
             new_lr_list[0].range = self.ranges[new_lr.index()].range;
             self.ranges[orig_lr.index()].range.to = split_at;
@@ -3124,10 +3169,20 @@ impl<'a, F: Function> Env<'a, F> {
         // the spill bundle.  (We are careful to treat the "starts at
         // def" flag as an implicit first def even if no def-type Use
         // is present.)
+        //
+        // Note that if `starts_at_loop_header` is set (this comes
+        // from the split-point adjustment heuristic that tries to
+        // split when a range enters into an inner loop body), we do
+        // not trim the start of `new_bundle`: we want the vreg to be
+        // loaded into a register for the whole inner-loop body if
+        // possible.
         while let Some(entry) = self.bundles[bundle.index()].ranges.last().cloned() {
             let end = entry.range.to;
             let vreg = self.ranges[entry.index.index()].vreg;
-            let last_use = self.ranges[entry.index.index()].uses.last().map(|u| u.pos);
+            let last_use = self.ranges[entry.index.index()]
+                .uses
+                .last()
+                .map(|u| u.pos());
             if last_use.is_none() {
                 let spill = self
                     .get_or_create_spill_bundle(bundle, /* create_if_absent = */ true)
@@ -3191,90 +3246,93 @@ impl<'a, F: Function> Env<'a, F> {
             }
             break;
         }
-        while let Some(entry) = self.bundles[new_bundle.index()].ranges.first().cloned() {
-            if self.ranges[entry.index.index()].has_flag(LiveRangeFlag::StartsAtDef) {
-                break;
-            }
-            let start = entry.range.from;
-            let vreg = self.ranges[entry.index.index()].vreg;
-            let first_use = self.ranges[entry.index.index()].uses.first().map(|u| u.pos);
-            if first_use.is_none() {
-                let spill = self
-                    .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
-                    .unwrap();
-                log::debug!(
-                    " -> bundle {:?} range {:?}: no uses; moving to spill bundle {:?}",
-                    new_bundle,
-                    entry.index,
-                    spill
-                );
-                self.bundles[spill.index()].ranges.push(entry);
-                self.bundles[new_bundle.index()].ranges.drain(..1);
-                self.ranges[entry.index.index()].bundle = spill;
-                continue;
-            }
-            let first_use = first_use.unwrap();
-            let split = ProgPoint::before(first_use.inst());
-            if split > start {
-                let spill = self
-                    .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
-                    .unwrap();
-                self.bundles[new_bundle.index()]
-                    .ranges
-                    .first_mut()
-                    .unwrap()
+        if !starts_at_loop_header {
+            while let Some(entry) = self.bundles[new_bundle.index()].ranges.first().cloned() {
+                if self.ranges[entry.index.index()].has_flag(LiveRangeFlag::StartsAtDef) {
+                    break;
+                }
+                let start = entry.range.from;
+                let vreg = self.ranges[entry.index.index()].vreg;
+                let first_use = self.ranges[entry.index.index()]
+                    .uses
+                    .first()
+                    .map(|u| u.pos());
+                if first_use.is_none() {
+                    let spill = self
+                        .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
+                        .unwrap();
+                    log::debug!(
+                        " -> bundle {:?} range {:?}: no uses; moving to spill bundle {:?}",
+                        new_bundle,
+                        entry.index,
+                        spill
+                    );
+                    self.bundles[spill.index()].ranges.push(entry);
+                    self.bundles[new_bundle.index()].ranges.drain(..1);
+                    self.ranges[entry.index.index()].bundle = spill;
+                    continue;
+                }
+                let first_use = first_use.unwrap();
+                let split = ProgPoint::before(first_use.inst());
+                if split > start {
+                    let spill = self
+                        .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
+                        .unwrap();
+                    self.bundles[new_bundle.index()]
+                        .ranges
+                        .first_mut()
+                        .unwrap()
+                        .range
+                        .from = split;
+                    self.ranges[self.bundles[new_bundle.index()]
+                        .ranges
+                        .first()
+                        .unwrap()
+                        .index
+                        .index()]
                     .range
                     .from = split;
-                self.ranges[self.bundles[new_bundle.index()]
-                    .ranges
-                    .first()
-                    .unwrap()
-                    .index
-                    .index()]
-                .range
-                .from = split;
-                let range = CodeRange {
-                    from: start,
-                    to: split,
-                };
-                let empty_lr = self.create_liverange(range);
-                self.bundles[spill.index()].ranges.push(LiveRangeListEntry {
-                    range,
-                    index: empty_lr,
-                });
-                self.ranges[empty_lr.index()].bundle = spill;
-                self.vregs[vreg.index()].ranges.push(LiveRangeListEntry {
-                    range,
-                    index: empty_lr,
-                });
-                log::debug!(
-                    " -> bundle {:?} range {:?}: first use implies split point {:?}",
-                    bundle,
-                    entry.index,
-                    first_use,
-                );
-                log::debug!(
-                    " -> moving leading empty region to new spill bundle {:?} with new LR {:?}",
-                    spill,
-                    empty_lr
-                );
+                    let range = CodeRange {
+                        from: start,
+                        to: split,
+                    };
+                    let empty_lr = self.create_liverange(range);
+                    self.bundles[spill.index()].ranges.push(LiveRangeListEntry {
+                        range,
+                        index: empty_lr,
+                    });
+                    self.ranges[empty_lr.index()].bundle = spill;
+                    self.vregs[vreg.index()].ranges.push(LiveRangeListEntry {
+                        range,
+                        index: empty_lr,
+                    });
+                    log::debug!(
+                        " -> bundle {:?} range {:?}: first use implies split point {:?}",
+                        bundle,
+                        entry.index,
+                        first_use,
+                    );
+                    log::debug!(
+                        " -> moving leading empty region to new spill bundle {:?} with new LR {:?}",
+                        spill,
+                        empty_lr
+                    );
+                }
+                break;
             }
-            break;
         }
 
         if self.bundles[bundle.index()].ranges.len() > 0 {
             self.recompute_bundle_properties(bundle);
-            let prio = self.compute_bundle_prio(bundle);
-            self.bundles[bundle.index()].prio = prio;
+            let prio = self.bundles[bundle.index()].prio;
             self.allocation_queue
                 .insert(bundle, prio as usize, reg_hint);
         }
         if self.bundles[new_bundle.index()].ranges.len() > 0 {
             self.recompute_bundle_properties(new_bundle);
-            let new_prio = self.compute_bundle_prio(new_bundle);
-            self.bundles[new_bundle.index()].prio = new_prio;
+            let prio = self.bundles[new_bundle.index()].prio;
             self.allocation_queue
-                .insert(new_bundle, new_prio as usize, reg_hint);
+                .insert(new_bundle, prio as usize, reg_hint);
         }
     }
 
@@ -3292,6 +3350,34 @@ impl<'a, F: Function> Env<'a, F> {
         }
         log::debug!(" -> final: {:?}", req);
         req
+    }
+
+    fn find_bundle_loop_split_point(&self, bundle: LiveBundleIndex) -> Option<ProgPoint> {
+        let mut deepest_transition = None;
+        let mut split_point = None;
+        for entry in &self.bundles[bundle.index()].ranges {
+            let from = entry.range.from;
+            let to = entry.range.to;
+            let from_block = self.cfginfo.insn_block[from.inst().index()].index();
+            let to_block = self.cfginfo.insn_block[to.prev().inst().index()].index();
+            let last_depth = self.cfginfo.approx_loop_depth[from_block];
+            for block in from_block + 1..=to_block {
+                let d = self.cfginfo.approx_loop_depth[block];
+                let is_transition = d != last_depth;
+                let transition_depth = std::cmp::max(d, last_depth);
+                log::debug!("looking for loop transition split point: bundle{} range{} crosses block{} is_transition {} depth {}",
+                            bundle.index(), entry.index.index(), block, is_transition, transition_depth);
+                if is_transition
+                    && (deepest_transition.is_none()
+                        || transition_depth > deepest_transition.unwrap())
+                {
+                    deepest_transition = Some(transition_depth);
+                    split_point = Some(self.cfginfo.block_entry[block]);
+                }
+            }
+        }
+        log::debug!("  -> loop split {:?}", split_point);
+        split_point
     }
 
     fn process_bundle(
@@ -3319,6 +3405,7 @@ impl<'a, F: Function> Env<'a, F> {
                 bundle,
                 /* split_at_point = */ bundle_start,
                 reg_hint,
+                /* adjusted_for_loop = */ false,
             );
             return Ok(());
         }
@@ -3440,7 +3527,7 @@ impl<'a, F: Function> Env<'a, F> {
                             OperandPolicy::Reg,
                             loop_depth as usize,
                             /* is_def = */ true,
-                        );
+                        ) as u32;
                         if lowest_cost_split_conflict_cost.is_none()
                             || (conflict_cost + move_cost)
                                 < lowest_cost_split_conflict_cost.unwrap()
@@ -3459,7 +3546,7 @@ impl<'a, F: Function> Env<'a, F> {
                             OperandPolicy::Reg,
                             loop_depth as usize,
                             /* is_def = */ true,
-                        );
+                        ) as u32;
 
                         if lowest_cost_split_conflict_cost.is_none()
                             || (max_cost + move_cost) < lowest_cost_split_conflict_cost.unwrap()
@@ -3588,29 +3675,25 @@ impl<'a, F: Function> Env<'a, F> {
                     self.bundle_spill_weight(bundle)
                 );
                 let bundle_start = self.bundles[bundle.index()].ranges[0].range.from;
-                let mut split_at_point =
-                    std::cmp::max(lowest_cost_split_conflict_point, bundle_start);
+                let split_at_point = std::cmp::max(lowest_cost_split_conflict_point, bundle_start);
                 let requeue_with_reg = lowest_cost_split_conflict_reg;
 
-                // Adjust `split_at_point` if it is within a deeper loop
-                // than the bundle start -- hoist it to just before the
-                // first loop header it encounters.
-                let bundle_start_depth = self.cfginfo.approx_loop_depth
-                    [self.cfginfo.insn_block[bundle_start.inst().index()].index()];
-                let split_at_depth = self.cfginfo.approx_loop_depth
-                    [self.cfginfo.insn_block[split_at_point.inst().index()].index()];
-                if split_at_depth > bundle_start_depth {
-                    for block in (self.cfginfo.insn_block[bundle_start.inst().index()].index() + 1)
-                        ..=self.cfginfo.insn_block[split_at_point.inst().index()].index()
-                    {
-                        if self.cfginfo.approx_loop_depth[block] > bundle_start_depth {
-                            split_at_point = self.cfginfo.block_entry[block];
-                            break;
-                        }
-                    }
-                }
+                // If this bundle spans more than one loop-nest level,
+                // pick the first loop-nest level transition as the split
+                // point instead.
+                let loop_split = self.find_bundle_loop_split_point(bundle);
+                let (split_at_point, adjusted_for_loop) = if loop_split.is_some() {
+                    (loop_split.unwrap(), true)
+                } else {
+                    (split_at_point, false)
+                };
 
-                self.split_and_requeue_bundle(bundle, split_at_point, requeue_with_reg);
+                self.split_and_requeue_bundle(
+                    bundle,
+                    split_at_point,
+                    requeue_with_reg,
+                    adjusted_for_loop,
+                );
                 return Ok(());
             } else {
                 // Evict all bundles in `conflicting bundles` and try again.
@@ -3626,9 +3709,11 @@ impl<'a, F: Function> Env<'a, F> {
 
     fn try_allocating_regs_for_spilled_bundles(&mut self) {
         log::debug!("allocating regs for spilled bundles");
-        for i in 0..self.spilled_bundles.len() {
-            let bundle = self.spilled_bundles[i]; // don't borrow self
-
+        // Sort spilled bundles by weight.
+        let mut spilled_bundles = std::mem::replace(&mut self.spilled_bundles, vec![]);
+        spilled_bundles
+            .sort_unstable_by_key(|bundle| self.bundles[bundle.index()].cached_spill_weight());
+        for bundle in spilled_bundles {
             let class = self.spillsets[self.bundles[bundle.index()].spillset.index()].class;
             let hint = self.spillsets[self.bundles[bundle.index()].spillset.index()].reg_hint;
 
@@ -4272,9 +4357,9 @@ impl<'a, F: Function> Env<'a, F> {
                 for use_idx in 0..self.ranges[entry.index.index()].uses.len() {
                     let usedata = self.ranges[entry.index.index()].uses[use_idx];
                     log::debug!("applying to use: {:?}", usedata);
-                    debug_assert!(range.contains_point(usedata.pos));
-                    let inst = usedata.pos.inst();
-                    let slot = usedata.slot;
+                    debug_assert!(range.contains_point(usedata.pos()));
+                    let inst = usedata.pos().inst();
+                    let slot = usedata.slot();
                     let operand = usedata.operand;
                     // Safepoints add virtual uses with no slots;
                     // avoid these.
@@ -5046,7 +5131,7 @@ impl<'a, F: Function> Env<'a, F> {
         for block in 0..self.func.blocks() {
             let block = Block::new(block);
             log::info!(
-                "block{}: [succs {:?} preds {:?}]",
+                "block{}: [succs {:?} preds {:?} approx_loop_depth {}]",
                 block.index(),
                 self.func
                     .block_succs(block)
@@ -5057,7 +5142,8 @@ impl<'a, F: Function> Env<'a, F> {
                     .block_preds(block)
                     .iter()
                     .map(|b| b.index())
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                self.cfginfo.approx_loop_depth[block.index()],
             );
             for inst in self.func.block_insns(block).iter() {
                 for annotation in self
