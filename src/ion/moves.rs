@@ -16,8 +16,9 @@ use super::{
     Env, InsertMovePrio, InsertedMove, LiveRangeFlag, LiveRangeIndex, RedundantMoveEliminator,
     VRegIndex, SLOT_NONE,
 };
-
-use crate::ion::data_structures::{BlockparamIn, BlockparamOut, CodeRange, PosWithPrio};
+#[cfg(debug_assertions)]
+use crate::ion::data_structures::CodeRange;
+use crate::ion::data_structures::{BlockparamIn, BlockparamOut, PosWithPrio};
 use crate::moves::ParallelMoves;
 use crate::{
     Allocation, Block, Edit, Function, Inst, InstPosition, OperandConstraint, OperandKind,
